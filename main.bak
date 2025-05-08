@@ -1,0 +1,557 @@
+# functions/main.py
+
+import functions_framework
+import telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+# from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext # Not used directly in single HTTP entry
+import firebase_admin
+from firebase_admin import credentials, firestore
+import requests
+import json
+import os
+import base64
+import re
+from datetime import datetime, timedelta
+
+# --- Global Variables (will be initialized in the webhook handler) ---
+db = None
+bot = None
+print("Forcing a change for deploy...")
+
+# --- Firebase Admin SDK and Bot Initialization (Idempotent) ---
+def initialize_services():
+    global db, bot
+    print("INIT: initialize_services called")
+    if not firebase_admin._apps:
+        try:
+            firebase_admin.initialize_app()
+            print("Firebase Admin SDK initialized.")
+        except ValueError as e:
+            print(f"Firebase Admin SDK already initialized or error: {e}")
+    db = firestore.client()
+
+    telegram_token_env = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if telegram_token_env:
+        if bot is None or bot.token != telegram_token_env:
+            bot = telegram.Bot(token=telegram_token_env)
+            print("Telegram Bot initialized/re-initialized.")
+    elif bot is None:
+        print("CRITICAL: TELEGRAM_TOKEN environment variable not set. Bot cannot be initialized.")
+        # This state should prevent the function from proceeding if bot is needed.
+
+
+# --- LLM Interaction and JSON Cleaning ---
+def clean_llm_json_output(json_string):
+    match = re.search(r"```json\s*([\s\S]*?)\s*```", json_string, re.IGNORECASE)
+    if match:
+        cleaned_json_string = match.group(1)
+    else:
+        match_simple = re.search(r"```\s*([\s\S]*?)\s*```", json_string)
+        if match_simple:
+            cleaned_json_string = match_simple.group(1)
+        else:
+            cleaned_json_string = json_string
+    return cleaned_json_string.strip()
+
+
+def call_llm_for_receipt(image_bytes, image_mime_type="image/jpeg"):
+    gemini_api_key_env = os.environ.get("GEMINI_API_KEY")
+    if not gemini_api_key_env:
+        print("Error: GEMINI_API_KEY not set.")
+        raise ValueError("Gemini API Key is not configured.")
+
+    gemini_model_name = "gemini-2.0-flash"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model_name}:generateContent?key={gemini_api_key_env}"
+    base64_image_data = base64.b64encode(image_bytes).decode('utf-8')
+
+    prompt_text = """
+    You are an expert AI assistant specializing in processing grocery receipts.
+    Your task is to analyze the provided image of a grocery receipt, which is primarily in Hebrew.
+    You must extract specific information, translate relevant Hebrew text to English, categorize items, and return ALL output as a single, well-formed JSON object matching the specified schema.
+
+    **Input:**
+    *   An image file containing a single grocery receipt written primarily in Hebrew.
+
+    **Processing Steps & Extraction Rules:**
+
+    1.  **Overall Receipt Information (Translate to English where specified):**
+        *   **`store_name` (String, English):** Extract the store name from the receipt and translate it to English.
+        *   **`date` (String, `YYYY-MM-DD`):** Extract the transaction date. Convert common Hebrew date formats (e.g., DD/MM/YYYY, DD.MM.YY) to `YYYY-MM-DD` format.
+        *   **`total_price` (Number):** Extract the final total amount paid (often labeled "סה\"כ", "סה\"כ לתשלום", "סופי", "לתשלום"). Ensure this is a numerical value. If not found, use `null`.
+        *   **`currency_code` (String, optional):** If identifiable (e.g., ₪), output "ILS". If not clear or other, use `null` or omit.
+
+    2.  **Line Items Processing (Translate item names and units to English):**
+        *   Identify each individual product or service listed.
+        *   For *each* item, create an object with the following fields:
+            *   **`item_name` (String, English):** Extract the item description in Hebrew and translate it to English.
+            *   **`item_price` (Number):** Extract the total price for this specific line item (considering quantity if applicable). Ensure this is a numerical value. If not found, use `null`.
+            *   **`grocery_category` (String, English):** Based on the *translated* item name, assign ONE category from the following list: "Produce", "Dairy & Eggs", "Meat & Seafood", "Bakery", "Pantry Staples", "Frozen Foods", "Beverages (Non-alcoholic)", "Alcohol", "Snacks & Sweets", "Household Supplies", "Personal Care", "Baby Items", "Pet Supplies", "Other". If unsure, use "Other".
+            *   **`quantity` (Number, optional):** Extract the quantity of the item (e.g., from "2 x", or a number preceding the item). If not explicitly stated or clearly '1', assume 1. If truly unknown or not applicable, use `null`.
+            *   **`price_per_unit` (Number, optional):** If explicitly listed, extract. If calculable (`item_price` / `quantity`), calculate. If single unit (`quantity`=1), can be `item_price`. If indeterminable, use `null`.
+            *   **`unit_of_measurement` (String, English, optional):** Extract unit. Translate: "ק\"ג" -> "kg", "גרם" -> "g", "ליטר" -> "L", "מ\"ל" -> "ml", "יח'", "יחידה" -> "unit", "אריזה", "חבילה" -> "pack". If unknown, use "unit" or `null`.
+
+    **Output Format (Strict JSON):**
+    You MUST return your entire response as a single, valid JSON object. Do not include any explanatory text before or after the JSON.
+    Schema:
+    ```json
+    {
+      "store_name": "Example Supermarket", "date": "2024-05-15", "total_price": 138.50, "currency_code": "ILS",
+      "items": [
+        { "item_name": "Milk 3%", "item_price": 6.20, "grocery_category": "Dairy & Eggs", "quantity": 1, "price_per_unit": 6.20, "unit_of_measurement": "L" }
+      ]
+    }
+    ```
+    **Important Notes for AI:** Prioritize accuracy. Adherence to JSON schema and data types (String, Number, `null`) is mandatory. Use `null` for genuinely unavailable information.
+    """
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text},
+                                {"inline_data": {"mime_type": image_mime_type, "data": base64_image_data}}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 4096}
+    }
+    headers = {'Content-Type': 'application/json'}
+
+    print(f"Sending request to Gemini API for receipt processing.")
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=180)
+        response.raise_for_status()
+        response_json_data = response.json()
+
+        if not response_json_data.get('candidates'):
+            print(f"Error: No candidates in Gemini response. Full Response: {response_json_data}")
+            raise ValueError("LLM response error: No candidates found.")
+
+        generated_json_str_from_llm = response_json_data['candidates'][0]['content']['parts'][0]['text']
+        cleaned_json_str = clean_llm_json_output(generated_json_str_from_llm)
+        parsed_json = json.loads(cleaned_json_str)
+        return parsed_json
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Gemini API: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            print(f"Gemini API Response Status: {e.response.status_code}")
+            try:
+                print(f"Gemini API Response Body: {e.response.json()}")
+            except json.JSONDecodeError:
+                print(f"Gemini API Response Body (not JSON): {e.response.text}")
+        raise ValueError(f"Network or API error communicating with LLM: {str(e)}")
+    except json.JSONDecodeError as je:
+        print(
+            f"Critical Error: Failed to decode JSON from LLM after cleaning. Original: {generated_json_str_from_llm}, Cleaned: {cleaned_json_str}, Error: {je}")
+        raise ValueError(f"LLM returned invalid JSON. Please check raw output. Error: {je.msg}")
+    except (KeyError, IndexError) as e:
+        print(
+            f"Error parsing Gemini response structure: {e}. Full Response: {response_json_data if 'response_json_data' in locals() else 'N/A'}")
+        raise ValueError(f"LLM response parsing error: {e}")
+
+
+# --- Firestore Group and User Profile Helper Functions ---
+def get_user_profile(user_id_str):
+    profile_ref = db.collection('user_profiles').document(user_id_str)
+    profile_doc = profile_ref.get()
+    return profile_doc.to_dict() if profile_doc.exists else None
+
+
+def get_user_group_id(user_id_str):
+    profile = get_user_profile(user_id_str)
+    return profile.get('groupId') if profile else None
+
+
+def get_group_name(group_id):
+    if not group_id: return None
+    group_doc = db.collection('groups').document(group_id).get()
+    return group_doc.to_dict().get('groupName', 'Unknown Group') if group_doc.exists else 'Unknown Group'
+
+
+def create_group_in_firestore(user_id_str, group_name_str):
+    if not group_name_str.strip(): return None, "Group name cannot be empty."
+    if get_user_group_id(user_id_str): return None, "You are already in a group. Leave first with /leavegroup."
+
+    new_group_ref = db.collection('groups').document()
+    group_data = {
+        'groupName': group_name_str.strip(), 'ownerId': user_id_str,
+        'createdAt': firestore.SERVER_TIMESTAMP, 'memberUserIds': [user_id_str]
+    }
+    new_group_ref.set(group_data)
+    group_id = new_group_ref.id
+    user_profile_ref = db.collection('user_profiles').document(user_id_str)
+    user_profile_ref.set({'telegramUserId': user_id_str, 'groupId': group_id, 'joinedAt': firestore.SERVER_TIMESTAMP},
+                         merge=True)
+    return group_id, f"Group '{group_name_str}' created! ID: `{group_id}`. Share this ID for others to join."
+
+
+def join_group_in_firestore(user_id_str, group_id_to_join):
+    if not group_id_to_join.strip(): return "Group ID cannot be empty."
+    if get_user_group_id(user_id_str): return "You are already in a group. Leave first with /leavegroup."
+
+    group_ref = db.collection('groups').document(group_id_to_join)
+    group_doc = group_ref.get()
+    if not group_doc.exists: return f"Group ID `{group_id_to_join}` not found."
+
+    group_ref.update({'memberUserIds': firestore.ArrayUnion([user_id_str])})
+    user_profile_ref = db.collection('user_profiles').document(user_id_str)
+    user_profile_ref.set(
+        {'telegramUserId': user_id_str, 'groupId': group_id_to_join, 'joinedAt': firestore.SERVER_TIMESTAMP},
+        merge=True)
+    return f"Successfully joined group '{group_doc.to_dict().get('groupName', 'Unnamed')}'. Receipts will now be shared."
+
+
+def leave_group_in_firestore(user_id_str):
+    current_group_id = get_user_group_id(user_id_str)
+    if not current_group_id: return "You are not in any group."
+
+    group_ref = db.collection('groups').document(current_group_id)
+    group_doc = group_ref.get()  # Get doc before potential delete
+    group_name = group_doc.to_dict().get('groupName',
+                                         'your current group') if group_doc.exists else 'your current group'
+
+    user_profile_ref = db.collection('user_profiles').document(user_id_str)
+    user_profile_ref.update({'groupId': firestore.DELETE_FIELD})  # Or set to None
+
+    if group_doc.exists:
+        group_ref.update({'memberUserIds': firestore.ArrayRemove([user_id_str])})
+        # Consider deleting group if owner leaves and it's empty, or if members array becomes empty
+        # For now, leaving empty groups.
+    return f"You have left '{group_name}'."
+
+
+def get_my_group_info(user_id_str):
+    current_group_id = get_user_group_id(user_id_str)
+    if not current_group_id: return "You are not in a group. Use `/creategroup <name>` or `/joingroup <ID>`."
+    group_ref = db.collection('groups').document(current_group_id)
+    group_doc = group_ref.get()
+    if not group_doc.exists:
+        db.collection('user_profiles').document(user_id_str).update({'groupId': firestore.DELETE_FIELD})
+        return "Error: Your group data was inconsistent. You've been removed from the non-existent group."
+
+    data = group_doc.to_dict()
+    info = f"Group: '{data.get('groupName')}' (ID: `{current_group_id}`)\n"
+    info += f"Owner: {data.get('ownerId')} {'(You)' if data.get('ownerId') == user_id_str else ''}\n"
+    info += f"Members: {len(data.get('memberUserIds', []))}"
+    return info
+
+
+# --- Firestore Aggregation Functions ---
+def get_query_target(user_id_str):
+    group_id = get_user_group_id(user_id_str)
+    if group_id:
+        group_name_str = get_group_name(group_id) or "Unnamed Group"
+        return 'groupId', group_id, f"for group '{group_name_str}'"
+    return 'telegramUserId', user_id_str, "(personal)"
+
+
+def _aggregate_spending(user_id_str, start_date_str, end_date_str, mode="total_by_date"):
+    # Generic helper for date-bound aggregations
+    query_field, query_value, context_label = get_query_target(user_id_str)
+    receipts_ref = db.collection('receipts')
+    query = receipts_ref.where(query_field, '==', query_value) \
+        .where('date', '>=', start_date_str) \
+        .where('date', '<=', end_date_str)
+
+    total_spent = 0
+    receipt_count = 0
+    category_spending = {}
+    store_spending = {}
+    currency = ""
+
+    docs = query.stream()
+    for doc_snapshot in docs:
+        data = doc_snapshot.to_dict()
+        current_total = data.get('total_price', 0)
+        total_spent += current_total
+        receipt_count += 1
+        currency = data.get('currency_code', 'N/A')  # Get from first receipt
+
+        if mode == "by_category":
+            for item in data.get('items', []):
+                category = item.get('grocery_category', 'Uncategorized')
+                item_price = item.get('item_price', 0)
+                category_spending[category] = category_spending.get(category, 0) + item_price
+        elif mode == "by_store":
+            store_name = data.get('store_name', 'Unknown Store')
+            store_spending[store_name] = store_spending.get(store_name, 0) + current_total
+
+    if receipt_count == 0:
+        return f"No receipts found {context_label} for the period."
+
+    if mode == "total_by_date":
+        return f"Total spent {context_label} ({receipt_count} receipts): {total_spent:.2f} {currency}"
+    elif mode == "by_category":
+        response_text = f"Spending by category {context_label} (Total: {total_spent:.2f} {currency}):\n"
+        for cat, amount in sorted(category_spending.items(), key=lambda item: item[1], reverse=True):
+            response_text += f"- {cat}: {amount:.2f}\n"
+        return response_text
+    elif mode == "by_store":
+        response_text = f"Spending by store {context_label} (Total: {total_spent:.2f} {currency}):\n"
+        for store, amount in sorted(store_spending.items(), key=lambda item: item[1], reverse=True):
+            response_text += f"- {store}: {amount:.2f}\n"
+        return response_text
+    elif mode == "avg_receipt":
+        avg = total_spent / receipt_count
+        return f"Average receipt value {context_label} ({receipt_count} receipts): {avg:.2f} {currency}"
+    return "Invalid aggregation mode."
+
+
+def get_spending_by_date_range_for_user(user_id_str, start_date_str, end_date_str):
+    try:
+        datetime.strptime(start_date_str, "%Y-%m-%d")  # Validate format
+        datetime.strptime(end_date_str, "%Y-%m-%d")  # Validate format
+    except ValueError:
+        return "Error: Invalid date format. Please use YYYY-MM-DD for both start and end dates."
+    return _aggregate_spending(user_id_str, start_date_str, end_date_str, mode="total_by_date")
+
+
+def get_spending_by_category_for_user(user_id_str, month_year_str):
+    try:
+        year, month = map(int, month_year_str.split('-'))
+        start_date = f"{year:04d}-{month:02d}-01"
+        if month == 12:
+            end_date = f"{year:04d}-12-31"
+        else:
+            end_date = (datetime(year, month + 1, 1) - timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return "Error: Invalid month format. Use YYYY-MM."
+    return _aggregate_spending(user_id_str, start_date, end_date, mode="by_category")
+
+
+def get_spending_by_store_for_user(user_id_str, month_year_str):
+    try:
+        year, month = map(int, month_year_str.split('-'))
+        start_date = f"{year:04d}-{month:02d}-01"
+        if month == 12:
+            end_date = f"{year:04d}-12-31"
+        else:
+            end_date = (datetime(year, month + 1, 1) - timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return "Error: Invalid month format. Use YYYY-MM."
+    return _aggregate_spending(user_id_str, start_date, end_date, mode="by_store")
+
+
+def get_average_receipt_value_for_user(user_id_str, month_year_str):
+    try:
+        year, month = map(int, month_year_str.split('-'))
+        start_date = f"{year:04d}-{month:02d}-01"
+        if month == 12:
+            end_date = f"{year:04d}-12-31"
+        else:
+            end_date = (datetime(year, month + 1, 1) - timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return "Error: Invalid month format. Use YYYY-MM."
+    return _aggregate_spending(user_id_str, start_date, end_date, mode="avg_receipt")
+
+
+# --- Telegram Bot UI ---
+def build_main_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📊 Current Month Summary", callback_data='summary_current_month')],
+        [InlineKeyboardButton("📅 Custom Date Range", callback_data='summary_date_range_prompt')],
+        [InlineKeyboardButton("🏷️ By Category (This Month)", callback_data='summary_category_current_month')],
+        [InlineKeyboardButton("🏪 By Store (This Month)", callback_data='summary_store_current_month')],
+        [InlineKeyboardButton("🧾 Avg. Receipt (This Month)", callback_data='summary_avg_receipt_current_month')],
+        [InlineKeyboardButton("👥 Group Management", callback_data='group_menu')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_group_menu_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("ℹ️ My Group Info", callback_data='mygroup_info_action')],
+        [InlineKeyboardButton("➕ Create Group", callback_data='creategroup_prompt')],
+        [InlineKeyboardButton("➡️ Join Group", callback_data='joingroup_prompt')],
+        [InlineKeyboardButton("🚪 Leave Group", callback_data='leavegroup_action')],
+        [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data='main_menu')],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+# --- Main Webhook Handler ---
+@functions_framework.http
+def telegram_webhook(request):
+    print(f"WEBHOOK: Received request. Method: {request.method}")
+    initialize_services()  # Ensure db and bot are ready
+    print('Lets GO!')
+
+    if bot is None:  # Critical check after initialization attempt
+        print("CRITICAL ERROR IN WEBHOOK: Bot not initialized. Exiting.")
+        return "Internal Server Error: Bot configuration issue", 500
+
+    if request.method != "POST":
+        return "Method Not Allowed", 405
+
+    update_json = request.get_json(force=True, silent=True, cache=False)
+    if not update_json:
+        print("Error: No JSON in request.")
+        return "Bad Request: No JSON", 400
+
+    update = telegram.Update.de_json(update_json, bot)
+
+    chat_id = None
+    user_id_str = None  # Telegram user ID as string
+    text_payload = None  # Can be command from text or callback_data
+
+    if update.message:
+        chat_id = update.message.chat_id
+        user_id_str = str(update.message.from_user.id)
+        text_payload = update.message.text
+    elif update.callback_query:
+        chat_id = update.callback_query.message.chat.id
+        user_id_str = str(update.callback_query.from_user.id)
+        text_payload = update.callback_query.data  # callback_data is the "command"
+        try:
+            bot.answer_callback_query(callback_query_id=update.callback_query.id)
+        except Exception as e_ack:
+            print(f"Error answering callback query {update.callback_query.id}: {e_ack}")
+
+    if not chat_id or not user_id_str:
+        print("Error: Could not determine chat_id or user_id from update.")
+        return "Bad Request: Invalid Telegram update", 400
+
+    # Ensure user profile exists, create if not (for associating telegramUserId)
+    user_profile_ref = db.collection('user_profiles').document(user_id_str)
+    if not user_profile_ref.get().exists:
+        user_profile_ref.set({'telegramUserId': user_id_str, 'groupId': None, 'createdAt': firestore.SERVER_TIMESTAMP},
+                             merge=True)
+        print(f"Created new user profile for {user_id_str}")
+
+    try:
+        current_month_year = datetime.now().strftime("%Y-%m")
+        command_part = ""
+        args_part = []
+
+        if text_payload:
+            if text_payload.startswith('/'):  # Actual command from text
+                parts = text_payload.split(maxsplit=1)
+                command_part = parts[0].lower()
+                if len(parts) > 1: args_part = parts[1].split()  # Simple space splitting for args
+            elif update.callback_query:  # Callback data acts as command
+                command_part = text_payload
+                # For callback_data, args might need to be embedded or handled differently
+
+        # --- Image Processing ---
+        if update.message and update.message.photo:
+            bot.send_message(chat_id=chat_id, text="Got your receipt! Analyzing with Gemini Vision...")
+            photo_file_id = update.message.photo[-1].file_id
+            photo_file = bot.get_file(photo_file_id)
+            image_response = requests.get(photo_file.file_path)
+            image_response.raise_for_status()
+            image_bytes = image_response.content
+            mime_type = "image/jpeg"  # Default
+
+            try:
+                receipt_data_dict = call_llm_for_receipt(image_bytes, image_mime_type=mime_type)
+
+                current_group_id = get_user_group_id(user_id_str)
+                receipt_data_dict['telegramUserId'] = user_id_str
+                if current_group_id:
+                    receipt_data_dict['groupId'] = current_group_id
+                else:
+                    receipt_data_dict.pop('groupId', None)
+
+                receipt_data_dict['uploadTimestamp'] = firestore.SERVER_TIMESTAMP
+                doc_ref = db.collection('receipts').add(receipt_data_dict)
+
+                group_context_name = get_group_name(current_group_id)
+                group_context_msg = f" for group '{group_context_name}'" if current_group_id and group_context_name else " (personal)"
+                total_price = receipt_data_dict.get('total_price', 'N/A')
+                currency = receipt_data_dict.get('currency_code', '')
+                bot.send_message(chat_id=chat_id,
+                                 text=f"Receipt processed{group_context_msg}! Total: {total_price} {currency}. Ref: {doc_ref.id}")
+
+            except ValueError as ve:  # Catch specific error from call_llm_for_receipt
+                bot.send_message(chat_id=chat_id, text=f"Processing Error: {str(ve)}")
+            except Exception as e_proc:
+                print(f"Error in receipt processing block for user {user_id_str}: {e_proc}")
+                bot.send_message(chat_id=chat_id, text="An unexpected error occurred processing the receipt image.")
+            return "OK", 200  # Done with image processing
+
+        # --- Menu and Command Handling ---
+        # Main Menu
+        if command_part == '/start' or command_part == '/menu' or command_part == 'main_menu':
+            group_id = get_user_group_id(user_id_str)
+            group_name_display = f" (Group: {get_group_name(group_id)})" if group_id else " (Personal)"
+            bot.send_message(chat_id=chat_id,
+                             text=f"Welcome{group_name_display}! Send a receipt image or choose an option:",
+                             reply_markup=build_main_menu_keyboard())
+
+        # Group Menu
+        elif command_part == 'group_menu':
+            bot.send_message(chat_id=chat_id, text="Group Management:", reply_markup=build_group_menu_keyboard())
+        elif command_part == 'mygroup_info_action':
+            bot.send_message(chat_id=chat_id, text=get_my_group_info(user_id_str), parse_mode='Markdown')
+        elif command_part == 'creategroup_prompt':  # This would ideally prompt for name
+            bot.send_message(chat_id=chat_id, text="To create a group, type: `/creategroup Your Desired Group Name`")
+        elif command_part == '/creategroup':
+            group_name_arg = " ".join(args_part) if args_part else ""  # Reconstruct name if spaces
+            if not group_name_arg:  # If command was /creategroup without args via text_payload directly
+                if text_payload and not text_payload.startswith('/'):  # Case where text_payload had the name directly
+                    group_name_arg = text_payload.split(maxsplit=1)[1] if len(
+                        text_payload.split(maxsplit=1)) > 1 else ""
+
+            _, msg = create_group_in_firestore(user_id_str, group_name_arg)
+            bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+        elif command_part == 'joingroup_prompt':
+            bot.send_message(chat_id=chat_id, text="To join a group, type: `/joingroup GROUP_ID`")
+        elif command_part == '/joingroup':
+            group_id_arg = args_part[0] if args_part else ""
+            if not group_id_arg:
+                if text_payload and not text_payload.startswith('/'):
+                    group_id_arg = text_payload.split(maxsplit=1)[1] if len(text_payload.split(maxsplit=1)) > 1 else ""
+            msg = join_group_in_firestore(user_id_str, group_id_arg)
+            bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+        elif command_part == 'leavegroup_action' or command_part == '/leavegroup':
+            bot.send_message(chat_id=chat_id, text=leave_group_in_firestore(user_id_str))
+
+        # Summaries
+        elif command_part == 'summary_current_month':
+            now = datetime.now()
+            start_of_month = now.replace(day=1).strftime("%Y-%m-%d")
+            end_of_month = (now.replace(month=now.month % 12 + 1, day=1) - timedelta(
+                days=1)) if now.month != 12 else now.replace(day=31).strftime("%Y-%m-%d")
+            bot.send_message(chat_id=chat_id,
+                             text=get_spending_by_date_range_for_user(user_id_str, start_of_month, end_of_month))
+        elif command_part == 'summary_category_current_month':
+            bot.send_message(chat_id=chat_id, text=get_spending_by_category_for_user(user_id_str, current_month_year))
+        elif command_part == 'summary_store_current_month':
+            bot.send_message(chat_id=chat_id, text=get_spending_by_store_for_user(user_id_str, current_month_year))
+        elif command_part == 'summary_avg_receipt_current_month':
+            bot.send_message(chat_id=chat_id, text=get_average_receipt_value_for_user(user_id_str, current_month_year))
+        elif command_part == 'summary_date_range_prompt':
+            bot.send_message(chat_id=chat_id, text="Use format: `/daterange YYYY-MM-DD YYYY-MM-DD`")
+        elif command_part == '/daterange':
+            if len(args_part) == 2:
+                bot.send_message(chat_id=chat_id,
+                                 text=get_spending_by_date_range_for_user(user_id_str, args_part[0], args_part[1]))
+            else:
+                bot.send_message(chat_id=chat_id, text="Usage: /daterange YYYY-MM-DD YYYY-MM-DD")
+
+        # Fallback for unrecognized text if not image and not a known command/callback
+        elif update.message and update.message.text and not (update.message.photo or command_part):
+            bot.send_message(chat_id=chat_id, text="I didn't understand that. Send a receipt image or use /menu.")
+
+        # If it was a callback query but no specific handler matched and it wasn't an image
+        elif update.callback_query and not command_part:
+            print(f"Warning: Unhandled callback_data '{text_payload}' for user {user_id_str}")
+            # Optionally send a generic "action not found" or just let it be (already ack'd)
+
+    except telegram.error.TelegramError as te:
+        print(f"Telegram API Error for user {user_id_str if user_id_str else 'unknown'}: {te}")
+        # Avoid sending message back if it's a fundamental Telegram issue
+    except Exception as e:
+        print(
+            f"Unhandled error in webhook for user {user_id_str if user_id_str else 'unknown'}: {type(e).__name__} - {str(e)}")
+        # Log the full traceback for debugging
+        import traceback
+        traceback.print_exc()
+        if chat_id and bot:  # Ensure bot is available
+            try:
+                bot.send_message(chat_id=chat_id,
+                                 text=f"A critical internal error occurred. Devs are notified. Error: {type(e).__name__}")
+            except Exception as nested_e:
+                print(f"Error sending final error message to user: {nested_e}")
+
+    return "OK", 200
+
+firebase_functions==0.1.0
+functions-framework>=3.0.0
+firebase-admin>=6.0.0
+python-telegram-bot==13.7.0
+requests>=2.20.0
