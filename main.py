@@ -1492,17 +1492,45 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
             return https_fn.Response("OK", status=200)
 
     # --- Image Processing (only for approved users or admin) ---
+    image_to_process_info = None  # Will store (file_id, file_name, mime_type_guess)
+
     if update.message and update.message.photo:
-        send_tg_message("Got your receipt! Analyzing with Gemini Vision...")
+        # Largest photo is usually best quality among compressed versions
         photo_file_id = update.message.photo[-1].file_id
-        photo_file = bot.get_file(photo_file_id)  # This is a blocking call in PTB v13
-        image_response = requests.get(photo_file.file_path)
-        image_response.raise_for_status()  # Check for download errors
-        image_bytes = image_response.content
-        mime_type = "image/jpeg"  # Default, Telegram usually converts
+        # Telegram photos are typically JPEGs after compression
+        image_to_process_info = (photo_file_id, "telegram_photo.jpg", "image/jpeg")
+        print(f"WEBHOOK: Detected photo message. File ID: {photo_file_id}")
+
+    elif update.message and update.message.document:
+        doc = update.message.document
+        print(
+            f"WEBHOOK: Detected document. MIME Type: {doc.mime_type}, File Name: {doc.file_name}, File ID: {doc.file_id}")
+        # Check if the document is an image type we want to process
+        if doc.mime_type and doc.mime_type.startswith('image/'):  # e.g., image/jpeg, image/png
+            # Use the document's reported MIME type if available, otherwise guess from extension
+            file_mime_type = doc.mime_type
+            image_to_process_info = (doc.file_id, doc.file_name, file_mime_type)
+        else:
+            send_tg_message(
+                "You sent a file, but it doesn't appear to be an image. Please send a photo or an image file (JPEG, PNG).")
+
+    if image_to_process_info:
+
+        file_id_for_download, original_filename, detected_mime_type = image_to_process_info  # Unpack
+
+        send_tg_message("Got your image! Analyzing with Gemini Vision...")
 
         try:
-            receipt_data_from_llm = call_llm_for_receipt(image_bytes, image_mime_type=mime_type)
+            photo_file = bot.get_file(file_id_for_download)
+            image_response = requests.get(photo_file.file_path)
+            image_response.raise_for_status()
+            image_bytes = image_response.content
+
+            # Use the detected_mime_type, or default if somehow still None
+            mime_type_for_llm = detected_mime_type if detected_mime_type else "image/jpeg"
+            print(f"IMGPROC: Processing image '{original_filename}' with MIME type '{mime_type_for_llm}'.")
+
+            receipt_data_from_llm = call_llm_for_receipt(image_bytes, image_mime_type=mime_type_for_llm)
 
             # --- FEATURE: Use Today's Date ---
             todays_date_str = datetime.now().strftime("%Y-%m-%d")
