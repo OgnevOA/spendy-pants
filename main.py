@@ -123,12 +123,60 @@ def call_llm_for_receipt(image_bytes: bytes, image_mime_type: str = "image/jpeg"
         response.raise_for_status()  # Raises HTTPError for bad responses (4XX or 5XX)
 
         response_json_data_from_api = response.json()
+
+        if response_json_data_from_api.get("promptFeedback"):
+            prompt_feedback = response_json_data_from_api["promptFeedback"]
+            if prompt_feedback.get("blockReason"):
+                block_reason_detail = prompt_feedback.get("blockReasonMessage", "No additional details.")
+                print(
+                    f"LLM_CALL ERROR: Prompt was blocked. Reason: {prompt_feedback['blockReason']}. Details: {block_reason_detail}")
+                raise ValueError(f"LLM prompt blocked: {prompt_feedback['blockReason']}. {block_reason_detail}")
+            if prompt_feedback.get("safetyRatings"):
+                for rating in prompt_feedback.get("safetyRatings", []):
+                    if rating.get("probability") not in ["NEGLIGIBLE", "LOW"]:  # Check for harmful content in prompt
+                        print(
+                            f"LLM_CALL WARNING: Prompt Safety Rating - Category: {rating.get('category')}, Probability: {rating.get('probability')}")
+
         if not response_json_data_from_api.get('candidates'):
             print(f"LLM_CALL ERROR: No candidates in Gemini response. Full Response: {response_json_data_from_api}")
             raise ValueError("LLM response error: No candidates found in API response.")
 
+        candidate = response_json_data_from_api['candidates'][0]
+        finish_reason = candidate.get('finishReason')
+
+        print(f"LLM_CALL INFO: Generation finishReason: {finish_reason}")
+
+        # Handle different finish reasons
+        if finish_reason not in [None, "STOP", "MAX_TOKENS", "MODEL_LENGTH"]:
+            # "MODEL_LENGTH" is similar to "MAX_TOKENS" for some models/contexts.
+            # Other reasons: "SAFETY", "RECITATION", "OTHER"
+            safety_ratings_text = ""
+            if candidate.get("safetyRatings"):
+                safety_ratings_text = " SafetyRatings: " + json.dumps(candidate.get("safetyRatings"))
+
+            print(
+                f"LLM_CALL WARNING: Generation finished due to an unusual reason: {finish_reason}.{safety_ratings_text}")
+            if not candidate.get('content') or not candidate['content']['parts']:  # If no content due to these reasons
+                raise ValueError(
+                    f"LLM generation stopped due to '{finish_reason}' and returned no usable content.{safety_ratings_text}")
+            # If there's content despite the finish reason, proceed but be wary.
+            # You might want to inform the user or flag for review.
+
+        elif finish_reason in ["MAX_TOKENS", "MODEL_LENGTH"]:
+            print(
+                f"LLM_CALL WARNING: Output may be truncated as it reached the token limit (finishReason: {finish_reason}).")
+            # Proceed with parsing, but the JSON might be incomplete.
+
+        if not candidate.get('content') or not candidate['content']['parts'] or not candidate['content']['parts'][
+            0].get('text'):
+            # This can happen even with a "STOP" reason if the model generates an empty response, or if responseMimeType: application/json failed.
+            print(
+                f"LLM_CALL ERROR: No text content found in candidate part, even if finishReason was '{finish_reason}'. Candidate: {candidate}")
+            raise ValueError("LLM response error: No text content found in the candidate.")
+
         # The actual JSON string is usually in the first part of the first candidate's content
-        generated_json_str_from_llm = response_json_data_from_api['candidates'][0]['content']['parts'][0]['text']
+        generated_json_str_from_llm = candidate['content']['parts'][0]['text']
+
         print(f"LLM_CALL: Raw string from Gemini (first 500 chars): {generated_json_str_from_llm[:500]}...")
 
         cleaned_json_str = clean_llm_json_output(generated_json_str_from_llm)
