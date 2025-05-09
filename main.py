@@ -903,6 +903,66 @@ def handle_edit_receipt_command(user_id_str: str, full_arg_string: str) -> str:
         print(f"EDIT_RECEIPT: Firestore update error for {doc_id_to_edit}: {e_update}")
         return f"Error: Could not update receipt `{doc_id_to_edit}` in the database."
 
+TELEGRAM_MESSAGE_MAX_LENGTH = 3096 # As per Telegram Bot API documentation
+
+
+def send_long_message(target_chat_id: int, full_text: str, parse_mode: str = None, reply_markup=None, bot_instance=None):
+    """
+    Splits a long message into chunks and sends them to Telegram,
+    respecting Markdown entities if possible (basic newline splitting).
+    Only the first message can have reply_markup if provided.
+    """
+    global bot  # Use the global bot instance if not provided
+    current_bot = bot_instance if bot_instance else bot
+
+    if not current_bot:
+        print("SEND_LONG_MSG_ERROR: Bot not initialized.")
+        return
+    if not target_chat_id:  # Check the passed argument
+        print("SEND_LONG_MSG_ERROR: target_chat_id not provided.")
+        return
+    # ... (rest of send_long_message logic, using target_chat_id instead of chat_id_int)
+    # Example change inside send_long_message:
+    # current_bot.send_message(chat_id=target_chat_id, text=current_chunk, ...)
+    if not full_text:
+        print("SEND_LONG_MSG_INFO: No text to send.")
+        return
+
+    lines = full_text.split('\n')
+    current_chunk = ""
+    message_count = 0
+
+    for i, line in enumerate(lines):
+        if len(current_chunk) + len(line) + 1 > TELEGRAM_MESSAGE_MAX_LENGTH:
+            if current_chunk.strip():
+                try:
+                    current_bot.send_message(
+                        chat_id=target_chat_id,
+                        text=current_chunk,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup if message_count == 0 else None
+                    )
+                    message_count += 1
+                except Exception as e:
+                    print(f"SEND_LONG_MSG_ERROR: Failed to send chunk to {target_chat_id}: {e}")
+            current_chunk = line
+        else:
+            if current_chunk:
+                current_chunk += "\n" + line
+            else:
+                current_chunk = line
+
+        if i == len(lines) - 1 and current_chunk.strip():
+            try:
+                current_bot.send_message(
+                    chat_id=target_chat_id,
+                    text=current_chunk,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup if message_count == 0 and i == len(lines) - 1 else None
+                )
+            except Exception as e:
+                print(f"SEND_LONG_MSG_ERROR: Failed to send final chunk to {target_chat_id}: {e}")
+
 def format_single_receipt_for_view(receipt_data: dict) -> str:
     """Formats a single receipt for detailed viewing."""
     if not receipt_data: return "Error: Receipt data not found."
@@ -1313,15 +1373,15 @@ def delete_receipt_from_firestore(acting_user_id_str: str, doc_id_to_delete: str
 
 def escape_markdown_v2(text: str) -> str:
     """
-    Escapes characters reserved in Telegram MarkdownV2 parse mode.
+    Escapes characters reserved in Telegram Markdown parse mode.
 
-    See: https://core.telegram.org/bots/api#markdownv2-style
+    See: https://core.telegram.org/bots/api#Markdown-style
     
     Args:
         text: The input string potentially containing reserved characters.
 
     Returns:
-        The escaped string, safe for use in MarkdownV2 messages.
+        The escaped string, safe for use in Markdown messages.
     """
     if not isinstance(text, str): # Handle non-string input gracefully
         return ""
@@ -1410,14 +1470,81 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
             # Args from callback_data usually need specific parsing if complex, e.g. "action:value"
 
     # --- Centralized Message Sending Function ---
-    def send_tg_message(text: str, reply_markup=None, parse_mode=None):
-        if not bot or not chat_id_int: return
+    def send_tg_message(target_chat_id: int, text: str, reply_markup=None, parse_mode=None):
+        global bot
+        if not bot:
+            print(f"SEND_TG_MSG: Bot not available.")
+            return
+        if not target_chat_id:
+            print(f"SEND_TG_MSG: target_chat_id not provided for text: {text[:50]}")
+            return
+
+        if len(text) > (TELEGRAM_MESSAGE_MAX_LENGTH - 200):  # Heuristic for long messages
+            print(
+                f"SEND_TG_MSG: Text length {len(text)} is potentially long, using send_long_message for chat {target_chat_id}.")
+            send_long_message(target_chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+        else:
+            try:
+                bot.send_message(chat_id=target_chat_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+            # ... (error handling as before) ...
+            except telegram.error.BadRequest as bre:
+                if "Can't parse entities" in str(bre):
+                    print(
+                        f"SEND_MSG_ERROR (short): Markdown Parse Error for {target_chat_id}. Trying plain. Text: {text[:100]}... Error: {bre}")
+                    try:
+                        bot.send_message(chat_id=target_chat_id, text=text, reply_markup=reply_markup)
+                    except Exception as fallback_e:
+                        print(f"SEND_MSG_ERROR (short): Fallback send failed for {target_chat_id}: {fallback_e}")
+                else:
+                    print(f"SEND_MSG_ERROR (short): Telegram BadRequest for {target_chat_id}: {bre}")
+            except telegram.error.TelegramError as te:
+                print(f"SEND_MSG_ERROR (short): Telegram API error for {target_chat_id}: {te}")
+            except Exception as e:
+                print(f"SEND_MSG_ERROR (short): Generic error for {target_chat_id}: {e}")
+
+    def edit_tg_message(target_chat_id: int, message_id_to_edit: int, text: str, reply_markup=None, parse_mode=None):
+        global bot
+        if not bot:
+            print(f"EDIT_TG_MSG: Bot not available.")
+            return
+        if not target_chat_id:
+            print(f"EDIT_TG_MSG: target_chat_id not provided for editing message {message_id_to_edit}.")
+            return
+
+        if len(text) >= TELEGRAM_MESSAGE_MAX_LENGTH:
+            print(
+                f"EDIT_MSG_WARN: New text for message {message_id_to_edit} is too long ({len(text)} chars). Sending as new message(s) instead.")
+            try:
+                bot.delete_message(chat_id=target_chat_id, message_id=message_id_to_edit)
+            except Exception as e_del_edit:
+                print(
+                    f"EDIT_MSG_WARN: Could not delete original message {message_id_to_edit} before sending long replacement: {e_del_edit}")
+            send_long_message(target_chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+            return
+
         try:
-            bot.send_message(chat_id=chat_id_int, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
-        except telegram.error.TelegramError as te:
-            print(f"SEND_MSG_ERROR: Telegram API error sending to {chat_id_int}: {te}")
+            bot.edit_message_text(chat_id=target_chat_id, message_id=message_id_to_edit,
+                                  text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+        # ... (error handling as before, using target_chat_id in logs) ...
+        except telegram.error.BadRequest as bre:
+            if "message is not modified" in str(bre):
+                print(f"EDIT_MSG_INFO: Message {message_id_to_edit} was not modified.")
+            elif "message can't be edited" in str(bre):
+                print(f"EDIT_MSG_ERROR: Message {message_id_to_edit} is too old or cannot be edited.")
+            elif "message is too long" in str(bre).lower() or "text is too long" in str(bre).lower():
+                print(
+                    f"EDIT_MSG_ERROR: Text for message {message_id_to_edit} is too long for edit. Sending as new message(s).")
+                try:
+                    bot.delete_message(chat_id=target_chat_id, message_id=message_id_to_edit)
+                except Exception as e_del_edit_long:
+                    print(
+                        f"EDIT_MSG_ERROR: Could not delete msg {message_id_to_edit} before sending long: {e_del_edit_long}")
+                send_long_message(target_chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                print(
+                    f"EDIT_MSG_ERROR: Telegram BadRequest editing {message_id_to_edit} for chat {target_chat_id}: {bre}")
         except Exception as e:
-            print(f"SEND_MSG_ERROR: Generic error sending to {chat_id_int}: {e}")
+            print(f"EDIT_MSG_ERROR: Generic error editing {message_id_to_edit} for chat {target_chat_id}: {e}")
 
     # --- Admin Command Handling (Bypasses regular user status checks for admin actions) ---
     if is_current_user_admin:
@@ -1432,20 +1559,20 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
                          "/addusertogroup <user_id> <group_id>\n"
                          "/removeuserfromgroup <user_id> <group_id>\n"
                          "/deletegroup <group_id>")
-            send_tg_message(help_text)
+            send_tg_message(chat_id_int, help_text)
         elif command_action == '/listusers':
-            send_tg_message(admin_list_users(command_args_list[0] if command_args_list else "all"),
+            send_tg_message(chat_id_int, admin_list_users(command_args_list[0] if command_args_list else "all"),
                             parse_mode='Markdown')
         elif command_action == '/approveuser':
-            send_tg_message(admin_set_user_status(command_args_list[0],
+            send_tg_message(chat_id_int, admin_set_user_status(command_args_list[0],
                                                   "approved") if command_args_list else "Usage: /approveuser <user_id>",
                             parse_mode='Markdown')
         elif command_action == '/banuser':
-            send_tg_message(admin_set_user_status(command_args_list[0],
+            send_tg_message(chat_id_int, admin_set_user_status(command_args_list[0],
                                                   "banned") if command_args_list else "Usage: /banuser <user_id>",
                             parse_mode='Markdown')
         elif command_action == '/setuserstatus':
-            send_tg_message(admin_set_user_status(command_args_list[0], command_args_list[1]) if len(
+            send_tg_message(chat_id_int, admin_set_user_status(command_args_list[0], command_args_list[1]) if len(
                 command_args_list) == 2 else "Usage: /setuserstatus <user_id> <approved|banned|pending_approval>",
                             parse_mode='Markdown')
         elif command_action == '/admincreategroup':
@@ -1466,44 +1593,45 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
                          initial_m_adm = [arg for arg in parts[1].split() if arg]
 
             if not group_name_adm:
-                 send_tg_message("Usage: /admincreategroup \"Group Name\" [UserID1 UserID2 ...]")
+                 send_tg_message(chat_id_int, "Usage: /admincreategroup \"Group Name\" [UserID1 UserID2 ...]")
             else:
                  _, msg_adm_create = create_group_in_firestore(user_id_str, group_name_adm, initial_member_ids=initial_m_adm)
-                 send_tg_message(msg_adm_create, parse_mode='MarkdownV2') # Use V2 for backticks
+                 send_tg_message(chat_id_int, msg_adm_create, parse_mode='Markdown') # Use V2 for backticks
             return https_fn.Response("OK", status=200)
             _, msg_adm_create = create_group_in_firestore(user_id_str, group_name_adm, initial_member_ids=initial_m_adm)
-            send_tg_message(msg_adm_create, parse_mode='Markdown')
+            send_tg_message(chat_id_int, msg_adm_create, parse_mode='Markdown')
         elif command_action == '/addusertogroup':
-            send_tg_message(admin_add_user_to_group(user_id_str, command_args_list[0], command_args_list[1]) if len(
+            send_tg_message(chat_id_int, admin_add_user_to_group(user_id_str, command_args_list[0], command_args_list[1]) if len(
                 command_args_list) == 2 else "Usage: /addusertogroup <user_id> <group_id>", parse_mode='Markdown')
         elif command_action == '/removeuserfromgroup':
-            send_tg_message(admin_remove_user_from_group(command_args_list[0], command_args_list[1]) if len(
+            send_tg_message(chat_id_int, admin_remove_user_from_group(command_args_list[0], command_args_list[1]) if len(
                 command_args_list) == 2 else "Usage: /removeuserfromgroup <user_id> <group_id>", parse_mode='Markdown')
         elif command_action == '/deletegroup':
             send_tg_message(
+                chat_id_int,
                 admin_delete_group(command_args_list[0]) if command_args_list else "Usage: /deletegroup <group_id>",
                 parse_mode='Markdown')
         # Admin menu buttons
         elif command_action == 'admin_menu':
-            send_tg_message("Admin Panel:", reply_markup=build_admin_menu_keyboard())
+            send_tg_message(chat_id_int, "Admin Panel:", reply_markup=build_admin_menu_keyboard())
         elif command_action == 'admin_list_pending':
-            send_tg_message(admin_list_users("pending_approval"), parse_mode='Markdown')
+            send_tg_message(chat_id_int, admin_list_users("pending_approval"), parse_mode='Markdown')
         elif command_action == 'admin_list_approved':
-            send_tg_message(admin_list_users("approved"), parse_mode='Markdown')
+            send_tg_message(chat_id_int, admin_list_users("approved"), parse_mode='Markdown')
         elif command_action == 'admin_list_all':
-            send_tg_message(admin_list_users("all"), parse_mode='Markdown')
+            send_tg_message(chat_id_int, admin_list_users("all"), parse_mode='Markdown')
         elif command_action == 'admin_approve_prompt':
-            send_tg_message("Type: `/approveuser USER_ID_TO_APPROVE`")
+            send_tg_message(chat_id_int, "Type: `/approveuser USER_ID_TO_APPROVE`")
         elif command_action == 'admin_ban_prompt':
-            send_tg_message("Type: `/banuser USER_ID_TO_BAN`")
+            send_tg_message(chat_id_int, "Type: `/banuser USER_ID_TO_BAN`")
         elif command_action == 'admin_creategroup_prompt':
-            send_tg_message("Type: `/admincreategroup \"Group Name\" OptionalUserID1 OptionalUserID2 ...`")
+            send_tg_message(chat_id_int, "Type: `/admincreategroup \"Group Name\" OptionalUserID1 OptionalUserID2 ...`")
         elif command_action == 'admin_addtogroup_prompt':
-            send_tg_message("Type: `/addusertogroup USER_ID_TO_ADD GROUP_ID`")
+            send_tg_message(chat_id_int, "Type: `/addusertogroup USER_ID_TO_ADD GROUP_ID`")
         elif command_action == 'admin_removefromgroup_prompt':
-            send_tg_message("Type: `/removeuserfromgroup USER_ID_TO_REMOVE GROUP_ID`")
+            send_tg_message(chat_id_int, "Type: `/removeuserfromgroup USER_ID_TO_REMOVE GROUP_ID`")
         elif command_action == 'admin_deletegroup_prompt':
-            send_tg_message("Type: `/deletegroup GROUP_ID_TO_DELETE`")
+            send_tg_message(chat_id_int, "Type: `/deletegroup GROUP_ID_TO_DELETE`")
         else:
             admin_action_handled = False  # Not an admin-specific command
 
@@ -1517,7 +1645,7 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
             # ensure_user_profile_exists already sent the message
             pass  # Message already sent by ensure_user_profile_exists
         elif current_user_status == 'banned' and not is_current_user_admin:
-            send_tg_message("Your account access has been restricted.")
+            send_tg_message(chat_id_int, "Your account access has been restricted.")
         else:  # Approved user or Admin typing /start
             command_action = 'main_menu'  # Fall through to show main menu
         # For /start, we typically don't want to fall through to other command processing immediately
@@ -1531,12 +1659,13 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
             # To be safe, can resend if command_action is not empty and not /start
             if command_action and command_action != '/start':
                 send_tg_message(
+                    chat_id_int,
                     f"Your account is pending approval. Your User ID is `{user_id_str}`. Please wait or contact the administrator.",
                     parse_mode='Markdown')
             return https_fn.Response("OK", status=200)
         elif current_user_status == 'banned':
             if command_action and command_action != '/start':  # Avoid double message if /start already handled it
-                send_tg_message("Your account access has been restricted.")
+                send_tg_message(chat_id_int, "Your account access has been restricted.")
             return https_fn.Response("OK", status=200)
 
     # --- Image Processing (only for approved users or admin) ---
@@ -1560,13 +1689,14 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
             image_to_process_info = (doc.file_id, doc.file_name, file_mime_type)
         else:
             send_tg_message(
+                chat_id_int,
                 "You sent a file, but it doesn't appear to be an image. Please send a photo or an image file (JPEG, PNG).")
 
     if image_to_process_info:
 
         file_id_for_download, original_filename, detected_mime_type = image_to_process_info  # Unpack
 
-        send_tg_message("Got your image! Analyzing with Gemini Vision...")
+        send_tg_message(chat_id_int, "Got your image! Analyzing with Gemini Vision...")
 
         try:
             photo_file = bot.get_file(file_id_for_download)
@@ -1621,21 +1751,21 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
                                 "The full details were too long to display here. "
                                 "You can still edit it using the Ref ID and the JSON structure if needed. "
                                 "To edit, see instructions after sending `/edithelp` or refer to the standard edit format.")
-                send_tg_message(summary_text, parse_mode='Markdown')
+                send_tg_message(chat_id_int, summary_text, parse_mode='Markdown')
             else:
-                send_tg_message(formatted_message_to_user, parse_mode='Markdown')
+                send_tg_message(chat_id_int, formatted_message_to_user, parse_mode='Markdown')
             # --- END FEATURE ---
 
         except ValueError as ve:  # Catch specific error from call_llm_for_receipt or other validation
-            send_tg_message(f"Receipt Processing Error: {str(ve)}")
+            send_tg_message(chat_id_int, f"Receipt Processing Error: {str(ve)}")
         except telegram.error.TelegramError as te:
             print(f"WEBHOOK IMGPROC: Telegram error during image processing for {user_id_str}: {te}")
-            send_tg_message("A Telegram error occurred while processing your receipt.")  # Generic to user
+            send_tg_message(chat_id_int, "A Telegram error occurred while processing your receipt.")  # Generic to user
         except Exception as e_proc:
             print(f"WEBHOOK IMGPROC: Unexpected error for {user_id_str}: {e_proc}")
             import traceback
             traceback.print_exc()
-            send_tg_message("An unexpected error occurred while processing the receipt image.")
+            send_tg_message(chat_id_int, "An unexpected error occurred while processing the receipt image.")
         return https_fn.Response("OK", status=200)  # Image processing done
 
     # --- Regular User Menu and Command Handling (Approved users / Admin using user features) ---
@@ -1645,27 +1775,27 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
     # --- NEW: Delete Receipts Command ---
     if command_action == '/deletereceipts':
          if not is_user_approved(user_id_str): # Check approval
-             send_tg_message("Your account is not approved for this action.")
+             send_tg_message(chat_id_int, "Your account is not approved for this action.")
          else:
              receipts, context = get_recent_receipts_for_user(user_id_str)
              message_text, reply_markup = format_receipt_list_for_delete(receipts, context)
-             send_tg_message(message_text, reply_markup=reply_markup, parse_mode='Markdown') # Use Markdown for list
+             send_tg_message(chat_id_int, message_text, reply_markup=reply_markup, parse_mode='Markdown') # Use Markdown for list
 
     # --- NEW: Delete Confirmation Request Callback ---
     elif command_action and command_action.startswith('del_confirm_req_'):
          doc_id_to_confirm = command_action.replace('del_confirm_req_', '')
          if not doc_id_to_confirm:
-             send_tg_message("Error: Invalid receipt reference in button.")
+             send_tg_message(chat_id_int, "Error: Invalid receipt reference in button.")
          else:
             receipt_to_confirm = get_receipt_details_for_view(doc_id_to_confirm)
             if not receipt_to_confirm:
-                 send_tg_message(f"Error: Receipt Ref: `{doc_id_to_confirm}` not found (maybe already deleted?).", parse_mode='Markdown')
+                 send_tg_message(chat_id_int, f"Error: Receipt Ref: `{doc_id_to_confirm}` not found (maybe already deleted?).", parse_mode='Markdown')
             else:
                 # Authorization check (Uploader or Admin)
                 is_admin_req = is_user_admin(user_id_str)
                 user_is_uploader_req = (receipt_to_confirm.get('telegramUserId') == user_id_str)
                 if not (is_admin_req or user_is_uploader_req):
-                     send_tg_message(f"Error: You are not authorized to delete receipt Ref: `{doc_id_to_confirm}`.", parse_mode='Markdown')
+                     send_tg_message(chat_id_int, f"Error: You are not authorized to delete receipt Ref: `{doc_id_to_confirm}`.", parse_mode='Markdown')
                 else:
                     # Send confirmation message with Yes/Cancel buttons
                     confirm_text = (f"❓ **Confirm Deletion**\n\n"
@@ -1676,70 +1806,73 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
                                     f"Total: {receipt_to_confirm.get('total_price', 0.0):.2f} {receipt_to_confirm.get('currency_code', '')}\n\n"
                                     f"⚠️ This action cannot be undone!")
                     confirm_keyboard = build_delete_confirmation_keyboard(doc_id_to_confirm)
-                    send_tg_message(confirm_text, reply_markup=confirm_keyboard, parse_mode='MarkdownV2')
+                    send_tg_message(chat_id_int, confirm_text, reply_markup=confirm_keyboard, parse_mode='Markdown')
     # --- NEW: Delete Execution Callback ---
     elif command_action and command_action.startswith('del_do_'):
         doc_id_to_delete = command_action.replace('del_do_', '')
         if not doc_id_to_delete:
-            send_tg_message("Error: Invalid receipt reference in delete confirmation.")
+            send_tg_message(chat_id_int, "Error: Invalid receipt reference in delete confirmation.")
         else:
             # We MUST re-check auth here before deleting
             delete_result_message = delete_receipt_from_firestore(user_id_str, doc_id_to_delete)
             # Edit the original confirmation message to show the result
             if update.callback_query and update.callback_query.message:
-                 edit_tg_message(message_id_to_edit=update.callback_query.message.message_id,
+                 edit_tg_message(chat_id_int,
+                                 message_id_to_edit=update.callback_query.message.message_id,
                                  text=delete_result_message, # Show result
                                  reply_markup=None, # Remove buttons
-                                 parse_mode='MarkdownV2') # Use V2 for backticks
+                                 parse_mode='Markdown') # Use V2 for backticks
             else: # Should have message context, but fallback to new message
-                 send_tg_message(delete_result_message, parse_mode='MarkdownV2')
+                 send_tg_message(chat_id_int, delete_result_message, parse_mode='Markdown')
     # --- NEW: Delete Cancellation Callback ---
     elif command_action and command_action.startswith('del_cancel_'):
         doc_id_cancelled = command_action.replace('del_cancel_', '')
         cancel_message = f"Deletion cancelled for receipt Ref: `{doc_id_cancelled}`."
         # Edit the original confirmation message
         if update.callback_query and update.callback_query.message:
-             edit_tg_message(message_id_to_edit=update.callback_query.message.message_id,
+             edit_tg_message(chat_id_int,
+                             message_id_to_edit=update.callback_query.message.message_id,
                              text=cancel_message,
                              reply_markup=None, # Remove buttons
-                             parse_mode='MarkdownV2')
+                             parse_mode='Markdown')
         else:
-             send_tg_message(cancel_message, parse_mode='MarkdownV2')
+             send_tg_message(chat_id_int, cancel_message, parse_mode='Markdown')
 
     if command_action == 'main_menu':  # Also triggered by /start for approved users
-        send_tg_message("Main Menu:", reply_markup=build_main_menu_keyboard(is_current_user_admin))
+        send_tg_message(chat_id_int, "Main Menu:", reply_markup=build_main_menu_keyboard(is_current_user_admin))
 
     # User Group Menu
     elif command_action == 'group_menu_user':
-        send_tg_message("Group Options:", reply_markup=build_user_group_menu_keyboard(user_id_str))
+        send_tg_message(chat_id_int, "Group Options:", reply_markup=build_user_group_menu_keyboard(user_id_str))
     elif command_action == 'mygroup_info_action':
-        send_tg_message(get_my_group_info(user_id_str), parse_mode='Markdown')
+        send_tg_message(chat_id_int, get_my_group_info(user_id_str), parse_mode='Markdown')
     elif command_action == 'leavegroup_action_user':  # User initiated leave (non-admin)
-        send_tg_message(user_leave_group(user_id_str))
+        send_tg_message(chat_id_int, user_leave_group(user_id_str))
 
     # Summaries
     elif command_action == 'summary_current_month':
-        send_tg_message(get_spending_by_date_range_for_user(user_id_str, start_of_month, end_of_month))
+        send_tg_message(chat_id_int, get_spending_by_date_range_for_user(user_id_str, start_of_month, end_of_month))
     elif command_action == 'summary_category_current_month':
-        send_tg_message(get_spending_by_category_for_user(user_id_str, current_month_year_str))
+        send_tg_message(chat_id_int, get_spending_by_category_for_user(user_id_str, current_month_year_str))
     elif command_action == 'summary_store_current_month':
-        send_tg_message(get_spending_by_store_for_user(user_id_str, current_month_year_str))
+        send_tg_message(chat_id_int, get_spending_by_store_for_user(user_id_str, current_month_year_str))
     elif command_action == 'summary_avg_receipt_current_month':
-        send_tg_message(get_average_receipt_value_for_user(user_id_str, current_month_year_str))
+        send_tg_message(chat_id_int, get_average_receipt_value_for_user(user_id_str, current_month_year_str))
     elif command_action == 'summary_date_range_prompt':
-        send_tg_message("To get a summary for a custom date range, type:\n`/daterange YYYY-MM-DD YYYY-MM-DD`")
+        send_tg_message(chat_id_int, "To get a summary for a custom date range, type:\n`/daterange YYYY-MM-DD YYYY-MM-DD`")
     elif command_action == '/daterange':
         if len(command_args_list) == 2:
             send_tg_message(
+                chat_id_int,
                 get_spending_by_date_range_for_user(user_id_str, command_args_list[0], command_args_list[1]))
         else:
-            send_tg_message("Usage: /daterange YYYY-MM-DD_START YYYY-MM-DD_END")
+            send_tg_message(chat_id_int, "Usage: /daterange YYYY-MM-DD_START YYYY-MM-DD_END")
 
     # User trying to use admin-style group commands
     elif command_action == '/creategroup':
-        send_tg_message("Group creation is managed by the administrator. You can ask them to create a group for you.")
+        send_tg_message(chat_id_int, "Group creation is managed by the administrator. You can ask them to create a group for you.")
     elif command_action == '/joingroup':
-        send_tg_message("To join a group, please ask the administrator to add you using your User ID.")
+        send_tg_message(chat_id_int, "To join a group, please ask the administrator to add you using your User ID.")
 
     elif command_action == '/edit':
             # For multi-line input, full_arg_string will contain everything after "/edit "
@@ -1760,6 +1893,7 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
 
             if not edit_data_payload:
                 send_tg_message(
+                    chat_id_int,
                     "To edit, send a message starting with `/edit` on a new line, then paste the `Ref:` line, followed by the corrected details in this format (one item per line):\n\n"
                     "`Ref: <PASTE_REF_ID_HERE>`\n"
                     "`Store: New Store Name (optional)`\n"
@@ -1772,11 +1906,11 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
                 )
             else:
                 edit_result_message = handle_simple_edit_receipt_command(user_id_str, edit_data_payload)
-                send_tg_message(edit_result_message, parse_mode='Markdown')
+                send_tg_message(chat_id_int, edit_result_message, parse_mode='Markdown')
 
     # Fallback for unrecognized text if not image and not a known command/callback, and not /start
     elif update.message and update.message.text and not command_action and text_payload != '/start':
-        send_tg_message("I didn't understand that. Send a receipt image or use /menu for options.")
+        send_tg_message(chat_id_int, "I didn't understand that. Send a receipt image or use /menu for options.")
         action_handled_for_user = False  # Explicitly not handled
 
     # If it was a callback query but no specific handler matched above
@@ -1792,43 +1926,46 @@ def telegram_webhook(req: https_fn.Request) -> https_fn.Response:
     elif command_action == 'list_receipts_action' or command_action == '/listreceipts':
          receipts, context = get_recent_receipts_for_user(user_id_str)
          message_text, reply_markup = format_receipt_list_for_display(receipts, context)
-         send_tg_message(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+         send_tg_message(chat_id_int, message_text, reply_markup=reply_markup, parse_mode='Markdown')
     # --- END NEW ---
 
     # Handler for Delete Receipts button
     elif command_action == 'delete_receipts_action' or command_action == '/deletereceipts':
-         if not is_user_approved(user_id_str): send_tg_message("Your account is not approved.")
+         if not is_user_approved(user_id_str): send_tg_message(chat_id_int, "Your account is not approved.")
          else:
              receipts, context = get_recent_receipts_for_user(user_id_str)
              # Use the specific formatting function for delete buttons
              message_text, reply_markup = format_receipt_list_for_delete(receipts, context) 
-             send_tg_message(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+             send_tg_message(chat_id_int, message_text, reply_markup=reply_markup, parse_mode='Markdown')
 
     # --- NEW: View Receipt Callback Handling ---
     elif command_action and command_action.startswith('view_receipt_'):
         doc_id_to_view = command_action.replace('view_receipt_', '')
         if not doc_id_to_view:
-             send_tg_message("Error: Invalid receipt reference in button.")
+            send_tg_message(chat_id_int, "Error: Invalid receipt reference in button.")
         else:
             receipt_details = get_receipt_details_for_view(doc_id_to_view)
             if not receipt_details:
-                send_tg_message(f"Error: Could not find receipt details for Ref: `{doc_id_to_view}`", parse_mode='Markdown')
+                send_tg_message(chat_id_int,
+                            f"Error: Could not find receipt details for Ref: `{doc_id_to_view}`",
+                                parse_mode='Markdown')
             else:
-                # Authorization check (same logic as for edit)
+                # Authorization check ...
                 is_admin_viewing = is_user_admin(user_id_str)
                 user_is_uploader_view = (receipt_details.get('telegramUserId') == user_id_str)
                 user_group_id_view = get_user_group_id(user_id_str)
                 receipt_group_id_view = receipt_details.get('groupId')
-                user_in_receipt_group_view = (receipt_group_id_view is not None and user_group_id_view == receipt_group_id_view)
+                user_in_receipt_group_view = (
+                            receipt_group_id_view is not None and user_group_id_view == receipt_group_id_view)  # Fixed typo here
+
                 if not (is_admin_viewing or user_is_uploader_view or user_in_receipt_group_view):
-                     send_tg_message(f"Error: You are not authorized to view receipt `{doc_id_to_view}`.", parse_mode='Markdown')
+                    send_tg_message(chat_id_int, f"Error: You are not authorized to view receipt `{doc_id_to_view}`.",
+                                    parse_mode='Markdown')
                 else:
-                    # Format and send the detailed view
                     formatted_detail_view = format_single_receipt_for_view(receipt_details)
-                    # Decide whether to edit the original list message or send a new one
-                    # Sending new is simpler for now
-                    send_tg_message(formatted_detail_view, parse_mode='Markdown') # Use V2 for better code block/backtick handling
-    # --- END NEW ---
+                    # Use the updated send_tg_message which might call send_long_message
+                    send_tg_message(chat_id_int, formatted_detail_view, parse_mode='Markdown')
+                    # --- END NEW ---
 
     if not action_handled_for_user and command_action:  # A command was parsed but no handler hit
         print(f"WEBHOOK: Parsed command_action '{command_action}' but no handler was matched for user {user_id_str}.")
