@@ -113,7 +113,7 @@ def call_llm_for_receipt(image_bytes: bytes, image_mime_type: str = "image/jpeg"
     payload = {
         "contents": [{"parts": [{"text": prompt_text},
                                 {"inline_data": {"mime_type": image_mime_type, "data": base64_image_data}}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 4096}
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1, "maxOutputTokens": 16384}
     }
     headers = {'Content-Type': 'application/json'}
 
